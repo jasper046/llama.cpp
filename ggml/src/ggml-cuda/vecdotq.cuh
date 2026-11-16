@@ -109,6 +109,7 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
+#define VDR_TQ2_0_Q8_1_MMVQ 1
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
@@ -751,7 +752,41 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * d8 * sumi;
 }
 
-static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+
+// TQ2_0: ternary weights, 256-element blocks, one fp16 scale.
+// Layout (from dequantize_row_tq2_0): byte m of segment s holds pair l for element s*128 + l*32 + m.
+// A thread handles one 32-element chunk c: reads all 8 ints of segment c>>2, extracts bit-plane c&3.
+static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_tq2_0 * bt = (const block_tq2_0 *) vbq + kbx;
+
+    const float d2 = __half2float(*(const half *) &bt->d);
+    const int   seg  = iqs >> 2;   // 32-byte segment of qs
+    const int   lane = iqs & 3;    // bit-pair index within each byte
+
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+
+    int sumi0 = 0, sumi1 = 0;   // two accumulators (low/high 16 quants of the chunk) to shorten the dp4a chain
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int x   = get_int_b2(bt->qs, seg*8 + j);   // sizeof(block_tq2_0) == 66: blocks are only 2-byte aligned
+        const int sel = (x >> (2*lane)) & 0x03030303;  // byte k of sel = pair value of byte k
+#if defined(GGML_USE_HIP)
+        const int v = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, sel); // q-1 in {-1,0,+1,+2} -> FF,00,01,02
+#else
+        const int v = __byte_perm(0x020100FF, 0x020100FF, sel);
+#endif
+        if (j < 4) sumi0 = ggml_cuda_dp4a(v, get_int_b4(bq8_1_chunk->qs, j), sumi0);
+        else       sumi1 = ggml_cuda_dp4a(v, get_int_b4(bq8_1_chunk->qs, j), sumi1);
+    }
+
+    // q8_1 ds = (d, sum): one scale per 32-quant block; perm already yields q-1, so no sum term needed
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * (float)(sumi0 + sumi1);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1_chunk(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
@@ -766,6 +801,24 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
 
+#if defined(GGML_USE_HIP)
+    // Bit-plane form: weight byte m of a 16-weight group holds elements 4m+k in crumb k, so
+    // (w >> 2k) & 0x03030303 is plane k = {elem k, 4+k, 8+k, 12+k}. quantize_q8_1<true> stores the activations
+    // 4x4-byte-transposed per 16-group, so plane k pairs with int k directly: one dp4a per plane.
+    // Codes c = q+1 in {0,1,2} are used as-is; the "-1" bias is folded in afterwards via the q8_1 sum (ds.y).
+    int sumi = 0;
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const int w = get_int_b2(bq2_0->qs, iqs*2 + g);   // qs sits at offset 2 in an 18-byte block: 2-byte aligned only
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            sumi = ggml_cuda_dp4a((w >> (2*k)) & 0x03030303, get_int_b4(bq8_1_chunk->qs, 4*g + k), sumi);
+        }
+    }
+
+    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
+    return d2 * (ds8f.x * sumi - ds8f.y);
+#else
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -795,6 +848,19 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_Q2_0_Q8_1_MMVQ; ++i) {
+        const int iqs_i = iqs + i;
+        sum += vec_dot_q2_0_q8_1_chunk(vbq, bq8_1, kbx, iqs_i);
+    }
+    return sum;
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

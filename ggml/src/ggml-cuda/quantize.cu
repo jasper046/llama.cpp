@@ -50,6 +50,7 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 #endif // CUDART_VERSION >= 12080
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+template <bool transposed16>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * x_ptr, void * vy_ptr,
@@ -91,7 +92,10 @@ static __global__ void quantize_q8_1(
 
     const int sum = warp_reduce_sum<QK8_1>((int) q);
 
-    y[ib].qs[iqs] = q;
+    // transposed16: within each 16-quant group store element 4m+k at position 4k+m (4x4 byte transpose),
+    // so Q2_0's bit-plane dot (vec_dot_q2_0_q8_1, HIP) can dp4a each weight plane against one aligned int.
+    const int64_t iqs_dst = transposed16 ? ((iqs & 16) | ((iqs & 3) << 2) | ((iqs >> 2) & 3)) : iqs;
+    y[ib].qs[iqs_dst] = q;
 
     if (iqs > 0) {
         return;
@@ -534,9 +538,19 @@ static __global__ void quantize_mmq_q8_1(
             ib = ib0 + k_block*ne1 + blockIdx.x;
         }
 
-        // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
-        char4 * yqs4 = (char4 *) y[ib].qs;
-        yqs4[iqs/4] = q;
+        if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR) {
+            // 4x4 byte transpose per 16 quants: element 4m+k -> position 4k+m (Q2_0 bit-plane dot)
+            const int base = iqs & ~15;
+            const int m    = (iqs >> 2) & 3;
+            y[ib].qs[base +  0 + m] = q.x;
+            y[ib].qs[base +  4 + m] = q.y;
+            y[ib].qs[base +  8 + m] = q.z;
+            y[ib].qs[base + 12 + m] = q.w;
+        } else {
+            // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+            char4 * yqs4 = (char4 *) y[ib].qs;
+            yqs4[iqs/4] = q;
+        }
 
         if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
             if (iqs % 16 == 0 && iqs < 96) {
@@ -546,7 +560,7 @@ static __global__ void quantize_mmq_q8_1(
                 }
             }
         } else if (iqs % 32 == 0) {
-            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4 || ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR) {
                 y[ib].ds4[iqs/32] = make_half2(d, sum);
             } else {
                 y[ib].d4[iqs/32]  = d;
@@ -557,7 +571,7 @@ static __global__ void quantize_mmq_q8_1(
 }
 
 void quantize_row_q8_1_cuda(
-        const float * x, void * vy,
+        const float * x, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     GGML_ASSERT(ne0 % QK8_1 == 0);
@@ -568,7 +582,14 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+#if defined(GGML_USE_HIP)
+    if (type_src0 == GGML_TYPE_Q2_0) {
+        ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+    ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    GGML_UNUSED(type_src0);
 }
 
 void quantize_mmq_q8_1_cuda(
@@ -589,6 +610,10 @@ void quantize_mmq_q8_1_cuda(
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
+                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR, false>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
@@ -693,6 +718,10 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR, true><<<num_blocks, block_size, 0, stream>>>(
                 x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:

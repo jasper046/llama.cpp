@@ -107,6 +107,70 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(MMQ_Q2_0_PLANAR)
+// Q2_0 against the planar-transposed q8_1 tile (quantize_mmq_q8_1<DS4_PLANAR>): weight int w holds 16 weights, plane k is
+// (w >> 2k) & 0x03030303 (codes q+1 in {0,1,2}, mapped to q-1 bytes by v_perm) and pairs with y int k of the 16-group.
+// vec_dot runs once per 128 weights (k00 = 0, MMQ_TILE_NE_K).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_0_planar_dp4a(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_0, I);
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + txs.qs;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_ds = (const half2 *) y;
+
+    const int h = k00 / MMQ_TILE_NE_K;   // which 128-weight half of the 256-weight x tile
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += warp_size) {
+        const int i = i0 + threadIdx.x;
+
+        const int   * xi  = x_qs + i*(MMQ_TILE_NE_K/2 + 1) + 8*h;
+        const float * dfi = x_df + i*5 + 2*h;
+
+#pragma unroll 1
+        for (int c = 0; c < 4; ++c) {   // 32-weight chunks (rolled: keeps register pressure down)
+            // unpack this chunk's 8 bit-planes once; they are reused for every column j below
+            int p[8];
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const int w = xi[2*c + g];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    p[4*g + k] = (w >> (2*k)) & 0x03030303;
+                }
+            }
+            const float d = dfi[c >> 1];
+
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += nwarps) {
+                const int j = j0 + threadIdx.y;
+
+                const int4 * yv = (const int4 *) (y_qs + j*MMQ_TILE_Y_K + 8*c);
+                const int4 y0 = yv[0];
+                const int4 y1 = yv[1];
+
+                int sumi = ggml_cuda_dp4a(p[0], y0.x, 0);
+                sumi = ggml_cuda_dp4a(p[1], y0.y, sumi);
+                sumi = ggml_cuda_dp4a(p[2], y0.z, sumi);
+                sumi = ggml_cuda_dp4a(p[3], y0.w, sumi);
+                sumi = ggml_cuda_dp4a(p[4], y1.x, sumi);
+                sumi = ggml_cuda_dp4a(p[5], y1.y, sumi);
+                sumi = ggml_cuda_dp4a(p[6], y1.z, sumi);
+                sumi = ggml_cuda_dp4a(p[7], y1.w, sumi);
+
+                const float2 ds = __half22float2(y_ds[j*MMQ_TILE_Y_K + c]);
+                sum[j0/nwarps*I/warp_size + i0/warp_size] += d * (ds.x * sumi - ds.y);
+            }
+        }
+    }
+}
+#endif // defined(MMQ_Q2_0_PLANAR)
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();

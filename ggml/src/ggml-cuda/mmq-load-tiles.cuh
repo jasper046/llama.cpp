@@ -208,6 +208,56 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(MMQ_Q2_0_PLANAR)
+// Q2_0 tile for the dp4a path, kept 2-bit packed: per row 4 blocks x 4 ints (stride 17) + 4 scales (stride 5).
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0_planar(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED(x_gate); // Q2_0 is not in ggml_cuda_mmq_fusion_supported, so no fused gate tile
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK2_0;          // 4
+    constexpr int threads_per_row = blocks_per_iter * 4;         // one int of qs per thread
+    constexpr int nrows           = warp_size / threads_per_row;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / 4;
+    const int kqsx = txi % 4;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbx;   // 18-byte blocks: qs is 2-byte aligned only
+        x_qs[i*(MMQ_TILE_NE_K/2 + 1) + txi] = get_int_b2(bxi->qs, kqsx);
+    }
+
+    constexpr int rows_per_warp = warp_size / blocks_per_iter;
+    const int ksx = threadIdx.x % blocks_per_iter;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+        int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_iter;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + ksx;
+        x_df[i*5 + ksx] = bxi->d;
+    }
+}
+#endif // defined(MMQ_Q2_0_PLANAR)
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     GGML_UNUSED(x_gate);

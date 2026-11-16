@@ -13800,6 +13800,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Ternary-Bonsai-2-27B (qwen35) decode shapes: {m, k}
+    for (auto mk : std::vector<std::pair<int64_t, int64_t>>{
+            {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144}, {10240, 5120}, {5120, 1024}, {5120, 12288}, {248320, 5120}}) {
+        for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0}) {
+            for (int bs : {1, 512}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 14336, n, 4096, {1, 1}, {1, 1}));

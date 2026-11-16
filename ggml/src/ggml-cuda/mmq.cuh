@@ -19,10 +19,18 @@ typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_sup,
     const ggml_glu_op glu_op, const float glu_limit, const float * __restrict__ x_scale, const float * __restrict__ gate_scale);
 
+// Opt-in (build with -DGGML_HIP_Q2_0_PLANAR_MMQ): on HIP dp4a GPUs without MFMA/WMMA (gfx906) Q2_0 keeps its weights
+// 2-bit packed in the tile and takes the activations 4x4-byte-transposed, so each weight bit-plane is one dp4a.
+// Not valid for MFMA/WMMA targets, which use the MMA data layout.
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_Q2_0_PLANAR_MMQ)
+#define MMQ_Q2_0_PLANAR 1
+#endif
+
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
     MMQ_Q8_1_DS_LAYOUT_D2S6,
+    MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR, // DS4 with every 16 quants stored as a 4x4 byte transpose (Q2_0 bit-plane dot)
 };
 
 static constexpr int QK8_1_MMQ  = 4*QK8_1;
@@ -63,8 +71,13 @@ static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected b
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+#if defined(MMQ_Q2_0_PLANAR)
+            return MMQ_Q8_1_DS_LAYOUT_DS4_PLANAR;
+#else
+            return MMQ_Q8_1_DS_LAYOUT_D4;
+#endif
+        case GGML_TYPE_Q1_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -387,6 +400,7 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
 
 #define MMQ_DP4A_TXS_Q4_0    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_0   + I/QI4_0,     0}
 #define MMQ_DP4A_TXS_Q4_1    tile_x_sizes{I*MMQ_TILE_NE_K   + I, I*MMQ_TILE_NE_K/QI4_1   + I/QI4_1,     0}
+#define MMQ_DP4A_TXS_Q2_0_PLANAR tile_x_sizes{I*(MMQ_TILE_NE_K/2) + I, I*5, 0} // 16 packed ints (stride 17) + 4 scales (stride 5) per row
 #define MMQ_DP4A_TXS_Q8_0    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_0 + I/(QI8_0/2), 0}
 #define MMQ_DP4A_TXS_Q8_0_16 tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*4/QI8_0 + I/(QI8_0/4), 0}
 #define MMQ_DP4A_TXS_Q8_1    tile_x_sizes{I*MMQ_TILE_NE_K*2 + I, I*MMQ_TILE_NE_K*2/QI8_1 + I/(QI8_1/2), 0}
@@ -399,7 +413,11 @@ static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, 
 static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml_type type, int I) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return MMQ_DP4A_TXS_Q8_0;
+#if defined(MMQ_Q2_0_PLANAR)
+        case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q2_0_PLANAR;
+#else
         case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
+#endif
         case GGML_TYPE_Q4_0:    return MMQ_DP4A_TXS_Q4_0;
         case GGML_TYPE_Q4_1:    return MMQ_DP4A_TXS_Q4_1;
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
@@ -608,11 +626,19 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
             case GGML_TYPE_Q2_0:
+#if defined(MMQ_Q2_0_PLANAR)
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q2_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_q2_0_planar<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q2_0_planar_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+#else
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q2_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q2_0<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback, prec_src1>);
+#endif // defined(MMQ_Q2_0_PLANAR)
             case GGML_TYPE_Q4_0:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q4_0_Q8_1_MMQ,

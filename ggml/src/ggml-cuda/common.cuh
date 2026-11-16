@@ -1101,6 +1101,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ2_0> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 1;
+    static constexpr int qi = 8;   // 8 chunks of 32 elements per block
+    static constexpr int bs = sizeof(block_tq2_0);
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
     static constexpr int qk = QK2_0;
     static constexpr int qr = QR2_0;
