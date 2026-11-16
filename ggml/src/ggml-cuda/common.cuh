@@ -435,28 +435,64 @@ static constexpr __device__ int ggml_cuda_get_max_cpy_bytes() {
 
 template <typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl(T value, int src_lane, int width = ggml_cuda_get_physical_warp_size(), ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __shfl(value, src_lane, width);
+    }
+#endif // defined(GGML_USE_HIP)
     return __shfl_sync(mask, value, src_lane, width);
 }
 
 template <typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl_up(T value, unsigned delta, int width = ggml_cuda_get_physical_warp_size(), ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __shfl_up(value, delta, width);
+    }
+#endif // defined(GGML_USE_HIP)
     return __shfl_up_sync(mask, value, delta, width);
 }
 
 template <typename T>
 static __device__ __forceinline__ T ggml_cuda_shfl_xor(T value, int lane_mask, int width = ggml_cuda_get_physical_warp_size(), ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __shfl_xor(value, lane_mask, width);
+    }
+#endif // defined(GGML_USE_HIP)
     return __shfl_xor_sync(mask, value, lane_mask, width);
 }
 
 static __device__ __forceinline__ ggml_cuda_thread_mask_t ggml_cuda_ballot(int predicate, ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __ballot(predicate);
+    }
+#endif // defined(GGML_USE_HIP)
     return __ballot_sync(mask, predicate);
 }
 
 static __device__ __forceinline__ int ggml_cuda_all(int predicate, ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __all(predicate);
+    }
+#endif // defined(GGML_USE_HIP)
     return __all_sync(mask, predicate);
 }
 
 static __device__ __forceinline__ int ggml_cuda_any(int predicate, ggml_cuda_thread_mask_t mask = GGML_CUDA_FULL_THREAD_MASK) {
+#if defined(GGML_USE_HIP)
+    // ROCm's *_sync builtins validate the mask with a waterfall loop on every call; skip it for the (constant) full mask.
+    if (mask == GGML_CUDA_FULL_THREAD_MASK) {
+        return __any(predicate);
+    }
+#endif // defined(GGML_USE_HIP)
     return __any_sync(mask, predicate);
 }
 
